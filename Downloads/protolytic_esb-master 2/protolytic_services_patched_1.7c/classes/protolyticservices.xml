@@ -1,0 +1,750 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:jms="http://www.mulesoft.org/schema/mule/jms"
+	xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata" xmlns:smtps="http://www.mulesoft.org/schema/mule/smtps"
+	xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:file="http://www.mulesoft.org/schema/mule/file" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns:json="http://www.mulesoft.org/schema/mule/json" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:context="http://www.springframework.org/schema/context"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/jms http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd
+http://www.mulesoft.org/schema/mule/smtps http://www.mulesoft.org/schema/mule/smtps/current/mule-smtps.xsd
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+	<context:property-placeholder location="mule-app.properties,classpath:mule-app.properties,file:///opt/esb/conf/protolytic-services.properties" ignore-resource-not-found="true" />
+    <db:mysql-config name="MySQL_Configuration" host="${db.host:localhost}" port="${db.port:3306}" user="${db.user:root}" password="${db.password:root}" database="${db.name:mprengine-v5}" doc:name="MySQL Configuration"/>
+    <http:listener-config name="ESBListenerEndpoint" host="0.0.0.0" port="8081" basePath="esb" doc:name="HTTP Listener Configuration"/>
+    <file:connector name="File" writeToDirectory="/tmp/file_drop/file_drop_br_pickup" readFromDirectory="/tmp/file_drop" workDirectory="/tmp/file_drop/work_dir" autoDelete="true" streaming="true" validateConnections="true" doc:name="File"/>
+    <file:connector name="File1" writeToDirectory="/private/tmp/protolytic-files" readFromDirectory="/private/tmp/protolytic-files" workDirectory="/private/tmp/protolytic-files" autoDelete="true" streaming="true" validateConnections="true" doc:name="File"/>
+    <jms:activemq-connector name="Active_MQ" username="admin" password="admin" brokerURL="tcp://localhost:61616" validateConnections="true" doc:name="Active MQ" specification="1.1"/>
+    <flow name="readClaimsByPatientTree">
+        <http:listener config-ref="ESBListenerEndpoint" path="readClaimNumberByPatientTree.json" doc:name="readClaimNumberByPatientTree.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Get Claims By Adjuster By Patient">
+            <db:parameterized-query><![CDATA[SELECT DISTINCT concat(claimant_last_name, ', ', claimant_first_name) patient_name, ri.claim_number
+FROM row_item ri, authority_row_item_detection rid, protolytic_claims_assignment ca
+WHERE ca.claim_number = ri.claim_number AND ca.date_to > NOW()
+AND ca.adjuster_name = #[message.inboundProperties.'http.query.params'.adjuster_name];]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+        <set-variable variableName="data" value="#[payload]" doc:name="Variable"/>
+        <scripting:component doc:name="JavaScript">
+            <scripting:script engine="JavaScript"><![CDATA[data = JSON.parse(data);
+
+var newData = { name :"root", expanded:true, children : [] }, 
+		levels = ["patient_name"];
+
+// For each data row, loop through the expected levels traversing the output tree
+data.forEach(function(d){
+    // Keep this as a reference to the current level
+    var depthCursor = newData.children;
+    // Go down one level at a time
+    levels.forEach(function( property, depth ){
+
+        // Look to see if a branch has already been created
+        var index;
+        depthCursor.forEach(function(child,i){
+            if ( d[property] == child.name ) index = i;
+        });
+        // Add a branch if it isn't there
+        if ( isNaN(index) ) {
+            depthCursor.push({ name : d[property], expanded:true, children : []});
+            index = depthCursor.length - 1;
+        }
+        // Now reference the new child array as we go deeper into the tree
+        depthCursor = depthCursor[index].children;
+        // This is a leaf, so add the last element to the specified branch
+        if ( depth === levels.length - 1 ) depthCursor.push({name: d.claim_number, leaf: 'true', expanded:true });
+    });
+});
+result = newData;]]></scripting:script>
+        </scripting:component>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readPatientDetails" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readPatientInfo.json" doc:name="readPatientInfo.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Get Patient Data">
+            <db:parameterized-query><![CDATA[select DISTINCT ri.id, ri.claim_number, concat(claimant_last_name, ', ', claimant_first_name) patient_name, claimant_ssn ssn, date(date_of_birth) dob, date(date_of_injury) doi, employer, sex, ri.icd_1_code, claimant_height height, claimant_weight weight, concat(claimant_address_street, ' ', claimant_address_city, ' ', claimant_address_state, ', ', claimant_address_zip) address, physician_name physician, physician_phone, physician_fax, claimant_catastrophic catastrophic, claimant_smoker smoker, adjuster_first_name, adjuster_last_name, adjuster_phone
+FROM row_item ri
+where 
+ri.claim_number =  #[message.inboundProperties.'http.query.params'.claim_number]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readClaimNotes" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readClaimNotes.json" doc:name="readClaimNotes.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Claim Notes Data">
+            <db:parameterized-query><![CDATA[select distinct claim_number, date(date) date, n.text, nt.text note_type
+FROM notes n, note_type nt
+where n.note_type_id = nt.id AND
+ n.claim_number = #[message.inboundProperties.'http.query.params'.claim_number]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readClaimsAssignedtoAdjusters" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readClaimsAssigned.json" doc:name="readClaims.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Claims Data">
+            <db:parameterized-query><![CDATA[select distinct ri.claim_number, concat(ri.claimant_last_name, ", ", ri.claimant_first_name) patient_name, ca.adjuster_name
+FROM row_item ri, protolytic_claims_assignment ca
+WHERE ri.claim_number = ca.claim_number AND ca.date_to > NOW();]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readNote_Type">
+        <http:listener config-ref="ESBListenerEndpoint" path="readNoteType.json" doc:name="readNoteType.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read NoteType Data">
+            <db:parameterized-query><![CDATA[SELECT id, text
+FROM note_type;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="createClaimNote">
+        <http:listener config-ref="ESBListenerEndpoint" path="createClaimNote.json" doc:name="createClaimNote.json"/>
+        <db:insert config-ref="MySQL_Configuration" doc:name="insert Claim Note">
+            <db:parameterized-query><![CDATA[INSERT INTO `notes`
+(`text`,
+`date`,
+`username`,
+`claim_number`,
+`organisation`,
+`note_type_id`,
+`classification_types_id`,
+`payer_id`,
+`process_type_id`)
+VALUES
+(#[message.inboundProperties.'http.query.params'.text],
+NOW(),
+#[message.inboundProperties.'http.query.params'.username],
+#[message.inboundProperties.'http.query.params'.claim_number],
+'protolytic',
+#[message.inboundProperties.'http.query.params'.note_type],
+'1',
+'1',
+'1');]]></db:parameterized-query>
+        </db:insert>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[select max(id) id from notes;]]></db:parameterized-query>
+        </db:select>
+        <db:insert config-ref="MySQL_Configuration" doc:name="create Claim Note Reminder">
+            <db:parameterized-query><![CDATA[INSERT INTO reminders
+(
+`note_id`,
+`followupDate`,
+`title`,
+`username`,
+`date`,
+`claim_number`,
+`organisation_id`,
+`process_type_id`,
+`contact_id`)
+VALUES
+(
+#[payload[0].id],
+#[message.inboundProperties.'http.query.params'.follow_up_date],
+'title',
+#[message.inboundProperties.'http.query.params'.username],
+NOW(),
+#[message.inboundProperties.'http.query.params'.claim_number],
+'1',
+'1',
+'0');]]></db:parameterized-query>
+        </db:insert>
+        <set-payload value="0" doc:name="Set Payload"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="createClaimOverride">
+        <http:listener config-ref="ESBListenerEndpoint" path="createClaimOverride.json" doc:name="HTTP"/>
+        <db:insert config-ref="MySQL_Configuration" doc:name="Insert Claim Override">
+            <db:parameterized-query><![CDATA[INSERT INTO `notes`
+(`claim_number`, `referral_number`, `adjuster_name`, `date`)
+VALUES
+(
+#[message.inboundProperties.'http.query.params'.claim_number],
+#[message.inboundProperties.'http.query.params'.referral_number],
+#[message.inboundProperties.'http.query.params'.adjuster_name],
+NOW()
+);]]></db:parameterized-query>
+        </db:insert>
+        <set-payload value="0" doc:name="Set Payload"/>
+    </flow>
+    <flow name="readRemindersByClaimByOrgByProcess">
+        <http:listener config-ref="ESBListenerEndpoint" path="readRemindersByClaimByOrgByProcess.json" doc:name="readRemindersByClaimByOrgByProcess"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[SELECT r.id, r.username, date(r.date) postedDate, date(followupDate) followupDate, r.title, n.text, r.active
+FROM reminders r, notes n
+where
+n.id = r.note_id AND
+r.claim_number =  #[message.inboundProperties.'http.query.params'.claim_number] AND
+r.organisation_id = '1' AND
+r.process_type_id = '1' AND
+r.active = '1';]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readRemindersHistoryByClaimByOrgByProcess">
+        <http:listener config-ref="ESBListenerEndpoint" path="readRemindersHistoryByClaimByOrgByProcess.json" doc:name="readRemindersHistoryByClaimByOrgByProcess"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[SELECT r.id, r.username, date(r.date) postedDate, date(followupDate) followupDate, r.title, n.text, r.active
+FROM reminders r, notes n
+where
+n.id = r.note_id AND
+r.claim_number =  #[message.inboundProperties.'http.query.params'.claim_number] AND
+r.organisation_id = '1' AND
+r.process_type_id = '1' AND
+r.active = '0';]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="updateReminderById">
+        <http:listener config-ref="ESBListenerEndpoint" path="updateReminderById.json" doc:name="updateReminderById.json"/>
+        <db:update config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[UPDATE reminders 
+SET active='0'
+WHERE
+id = #[message.inboundProperties.'http.query.params'.id]]]></db:parameterized-query>
+        </db:update>
+        <set-payload value="0" doc:name="Set Payload"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readGuidelines" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readGuidelines.json" doc:name="readGuidelines.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Get Guideline Data">
+            <db:parameterized-query><![CDATA[select DISTINCT eo.icd_code, eo.icd_name, eo.proc_code, eo.proc_code_name, eo.cpt_frequency prob, eo.cost_per_visit cost, eo.cost_mean, wa.workflow_action_text recommendation
+
+FROM eds_odg eo, workflow_actions wa, thresholds th
+where eo.icd_code = #[message.inboundProperties.'http.query.params'.icd_1_code]
+AND th.workflow_id = 2
+AND case when (eo.cpt_frequency <= th.probLow) then wa.id = 0 
+when ((eo.cpt_frequency >= th.probHigh) && (eo.cost_per_visit <= th.costLow)) then wa.id = 1
+else wa.id = 2 end;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readReferralsStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readReferralsStore.json" doc:name="readReferralsStore.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[select ri.procedure_code procedure_code, ri.icd_1_code icd_1_code, ri.claim_number claim_number
+FROM row_item ri
+WHERE
+(ri.id) NOT IN (select distinct row_item_ID from protolytic_referral_history) and
+ri.claim_number = #[message.inboundProperties.'http.query.params'.claim_number]]]></db:parameterized-query>
+        </db:select>
+        <set-variable variableName="forEach" value="#[new java.util.LinkedList()]" doc:name="Variable"/>
+        <foreach doc:name="For Each">
+            <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+            <enricher doc:name="Message Enricher">
+                <db:select config-ref="MySQL_Configuration" doc:name="Referral Data">
+                    <db:parameterized-query><![CDATA[SELECT DISTINCT ri.claim_number, ri.id, ri.icd_1_code, ri.procedure_code, ri.claimant_referral, (
+SELECT DISTINCT
+CASE 
+	when (eo.cpt_frequency <= th.probLow) then (select workflow_action_text from workflow_actions where id = 0)
+	when ((eo.cpt_frequency >= th.probHigh) && (eo.cost_per_visit <= th.costLow)) then (select workflow_action_text from workflow_actions where id = 1)
+	else  (select workflow_action_text from workflow_actions where id = 2)
+END as referral_action_id
+FROM
+eds_odg eo, thresholds th
+WHERE
+eo.proc_code = #[payload.procedure_code]
+and eo.icd_code = #[payload.icd_1_code] AND
+(eo.cpt_frequency <= th.probLow or (eo.cpt_frequency >= th.probHigh) && (eo.cost_per_visit <= th.costLow))
+) recommendation
+FROM row_item ri, workflow_actions wf
+WHERE
+(ri.id) NOT IN (select distinct row_item_ID from protolytic_referral_history) and
+ri.claim_number = #[payload.claim_number] AND
+ri.procedure_code = #[payload.procedure_code] AND
+ri.icd_1_code = #[payload.icd_1_code]]]></db:parameterized-query>
+                </db:select>
+                <enrich source="#[payload]" target="#[flowVars.forEach.add($)]"/>
+            </enricher>
+        </foreach>
+        <logger message="#[flowVars.forEach]" level="INFO" doc:name="Logger"/>
+        <set-payload value="#[flowVars.forEach]" doc:name="Set Payload"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+        <scripting:component doc:name="JavaScript">
+            <scripting:script engine="JavaScript"><![CDATA[var data = message.getPayloadAsString();
+data = JSON.parse(data);
+for(io = 0; io < data[0][io].length; io++){
+data[io] = data[0];
+}
+var newData = [];
+i = 0;
+data.forEach(function(d){
+newData[i] = {};
+newData[i].referral_info = d[0].claimant_referral;
+newData[i].icd_1_code = d[0].icd_1_code;
+newData[i].claim_number = d[0].claim_number;
+newData[i].referral_action_text = d[0].recommendation;
+newData[i].procedure_code = d[0].procedure_code;
+newData[i].id = d[0].id;
+i++;
+});
+
+result = newData; ]]></scripting:script>
+        </scripting:component>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readReferralActionsStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readReferralActionsStore.json" doc:name="readReferralActionsStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Referral Actions Data">
+            <db:parameterized-query><![CDATA[select referral_action_text, referral_action_id
+FROM referral_actions]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readReferralsHistoryStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readReferralsHistoryStore.json" doc:name="readReferralsHistoryStore.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Referral Data">
+            <db:parameterized-query><![CDATA[select referral_info, date(date) date, referral_action_id, referral_action_text, id, claim_number
+FROM protolytic_referral_history rh
+where rh.claim_number = #[message.inboundProperties.'http.query.params'.claim_number]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="updateReferralHistoryByIdStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="updateReferralHistoryById.json" doc:name="updateReferralHistoryById.json"/>
+        <db:insert config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[INSERT INTO protolytic_referral_history (claim_number, date, referral_info, referral_action_id, row_item_id, referral_action_text, referral_number) 
+VALUES (#[message.inboundProperties.'http.query.params'.claim_number], 
+NOW(), #[message.inboundProperties.'http.query.params'.referral_info], #[message.inboundProperties.'http.query.params'.referral_action_id], #[message.inboundProperties.'http.query.params'.id], #[message.inboundProperties.'http.query.params'.referral_action_text], #[message.inboundProperties.'http.query.params'.referral_number]);]]></db:parameterized-query>
+        </db:insert>
+        <set-payload value="0" doc:name="Set Payload"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readReferralsPendingStore.json" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readReferralsPendingStore.json" doc:name="readReferralsPendingStore.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Referrals Pending Data">
+            <db:parameterized-query><![CDATA[select referral_info, date, referral_action_id, referral_action_text, id, claim_number, referral_number
+FROM referral_processing
+where id = #[message.inboundProperties.'http.query.params'.id]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readProviderTypesStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readProviderTypesStore.json" doc:name="readProviderTypesStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="provider types Data">
+            <db:parameterized-query><![CDATA[select l1.text provider_type, l1.id level1_id, l1.id level1_id_data
+FROM entity_level1_labels l1]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readProviderNetworksStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readProviderNetworksStore.json" doc:name="readProviderNetworksStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="provider networks Data">
+            <db:parameterized-query><![CDATA[SELECT e2.id level2_id, e2.text provider_network 
+FROM entity_level2_labels e2, entity_level1_level2_labels e1e2, entity_level1_labels e1
+WHERE e2.id = e1e2.level2_ID AND e1e2.id = e1.id AND e1.text = #[message.inboundProperties.'http.query.params'.provider_type]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readProviderByNetworkByTypeStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readProviderByNetworkByTypeStore.json" doc:name="readProviderByNetworkByTypeStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="ENTITIES : Provider By Network By Type Data">
+            <db:parameterized-query><![CDATA[SELECT e.id entity_id, name, address_line_1, address_line_2, e.city, e.state, e.zip 
+FROM entity_level1_level2_labels el1el2, entity e 
+where el1el2.id = e.id AND level2_ID = #[message.inboundProperties.'http.query.params'.level2_id] AND level1_ID = #[message.inboundProperties.'http.query.params'.level1_id]]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Copy_of_Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readEntityByIDStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readEntityByIDStore.json" doc:name="readEntityByIDStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Select by ID: Entity Data">
+            <db:parameterized-query><![CDATA[SELECT name, address_line_1, address_line_2, city, state, zip, phone FROM protolytic.entity where id = #[message.inboundProperties.'http.query.params'.entity_id];]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readContactsByEntityStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readContactsByEntityStore.json" doc:name="readContactsByEntityStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Select by org ID: Contact Data">
+            <db:parameterized-query><![CDATA[SELECT c.first_name, c.last_name, CONCAT(c.first_name, ' ', c.last_name) name, cd.detail from contact c, contact_detail cd where cd.contact_id = c.id AND cd.type = 'e' AND c.organisation_id = #[message.inboundProperties.'http.query.params'.entity_id];]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readContactsByNameStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readContactsByNameStore.json" doc:name="readContactsByNameStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Copy_of_Select by org ID: Contact Data">
+            <db:parameterized-query><![CDATA[SELECT c.first_name, c.last_name, CONCAT(c.first_name, ' ', c.last_name) name, cd.detail from contact c, contact_detail cd where cd.contact_id = c.id AND cd.type = 'e' AND c.first_name = #[message.inboundProperties.'http.query.params'.first_name] AND c.last_name = #[message.inboundProperties.'http.query.params'.last_name];]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="readThresholdsStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readThresholdsStore.json" doc:name="readThresholdsStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Thresholds Data">
+            <db:parameterized-query><![CDATA[select workflow_id id, costLow, costHigh, probLow, probHigh
+from thresholds;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readWorkflowActions" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readWorkflowActionsStore.json" doc:name="readWorkflowActions"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Workflow Actions Data">
+            <db:parameterized-query><![CDATA[select workflow_action_text text, id
+FROM workflow_actions]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readThresholdRanges" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readThresholdRanges.json" doc:name="readThresholdValuesRanges"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Threshold Ranges Data">
+            <db:parameterized-query><![CDATA[select probabilty_range p_range, cost_range c_range
+from `threshold_ranges`]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="readThresholdsDataStore" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readThresholdsDataStore.json" doc:name="readThresholdsDataStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Copy_of_read Thresholds Data">
+            <db:parameterized-query><![CDATA[select workflow_action_text, workflow_action_id
+FROM workflow_actions]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="updateThresholdsStore">
+        <http:listener config-ref="ESBListenerEndpoint" path="updateThresholdsStore.json" doc:name="updateThresholdsStore"/>
+        <db:update config-ref="MySQL_Configuration" doc:name="Copy_of_Database">
+            <db:parameterized-query><![CDATA[UPDATE thresholds 
+SET probLow = #[message.inboundProperties.'http.query.params'.probLow], 
+probHigh = #[message.inboundProperties.'http.query.params'.probHigh], 
+costHigh = "& Above",
+costLow = #[message.inboundProperties.'http.query.params'.costLow]
+WHERE workflow_id = #[message.inboundProperties.'http.query.params'.workflow_id];]]></db:parameterized-query>
+        </db:update>
+        <db:update config-ref="MySQL_Configuration" doc:name="Copy_of_Copy_of_Database">
+            <db:parameterized-query><![CDATA[UPDATE thresholds 
+SET probHigh = #[message.inboundProperties.'http.query.params'.probLow]
+WHERE workflow_id = 0;]]></db:parameterized-query>
+        </db:update>
+        <db:update config-ref="MySQL_Configuration" doc:name="Copy_of_Copy_of_Database">
+            <db:parameterized-query><![CDATA[UPDATE thresholds 
+SET probLow = #[message.inboundProperties.'http.query.params'.probHigh], 
+costHigh = #[message.inboundProperties.'http.query.params'.costLow]
+WHERE workflow_id = 1;]]></db:parameterized-query>
+        </db:update>
+        <set-payload value="0" doc:name="Copy_of_Set Payload"/>
+        <json:object-to-json-transformer doc:name="Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readClaimNumberBySupervisorStore">
+        <http:listener config-ref="ESBListenerEndpoint" path="readClaimNumberBySupervisorStore.json" doc:name="readClaimNumberBySupervisorStore"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="readClaimNumberBySupervisorStore">
+            <db:parameterized-query><![CDATA[SELECT DISTINCT concat(claimant_last_name, ', ', claimant_first_name) patient_name, ri.claim_number, ca.adjuster_name adjuster_name
+FROM row_item ri, authority_row_item_detection rid, protolytic_claims_assignment ca
+WHERE ri.claim_number = ca.claim_number AND ca.date_to > NOW();]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Object to JSON"/>
+        <set-variable variableName="data" value="#[payload]" doc:name="Copy_of_Variable"/>
+        <scripting:component doc:name="Copy_of_JavaScript">
+            <scripting:script engine="JavaScript"><![CDATA[data = JSON.parse(data);
+
+var newData = { name :"root", expanded:true, children : [] }, 
+		levels = ["adjuster_name", "patient_name"];
+
+// For each data row, loop through the expected levels traversing the output tree
+data.forEach(function(d){
+    // Keep this as a reference to the current level
+    var depthCursor = newData.children;
+    // Go down one level at a time
+    levels.forEach(function( property, depth ){
+
+        // Look to see if a branch has already been created
+        var index;
+        depthCursor.forEach(function(child,i){
+            if ( d[property] == child.name ) index = i;
+        });
+        // Add a branch if it isn't there
+        if ( isNaN(index) ) {
+            depthCursor.push({ name : d[property], expanded:true, children : []});
+            index = depthCursor.length - 1;
+        }
+        // Now reference the new child array as we go deeper into the tree
+        depthCursor = depthCursor[index].children;
+        // This is a leaf, so add the last element to the specified branch
+        if ( depth === levels.length - 1 ) depthCursor.push({name: d.claim_number, leaf: 'true', expanded:true });
+    });
+});
+result = newData;]]></scripting:script>
+        </scripting:component>
+        <json:object-to-json-transformer doc:name="Copy_of_Object to JSON"/>
+    </flow>
+    <flow name="readClaimsUnassigned" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readClaimsUnassigned.json" doc:name="readClaimsUnassigned"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="readClaimsUnassigned Data">
+            <db:parameterized-query><![CDATA[SELECT DISTINCT ri.claim_number, concat(ri.claimant_last_name, ", ", ri.claimant_first_name) patient_name 
+FROM row_item ri
+	LEFT OUTER JOIN protolytic_claims_assignment ca
+		ON ri.claim_number = ca.claim_number
+WHERE ca.claim_number IS NULL OR ca.date_to < NOW();]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="updateClaimAssignmentsStore">
+        <http:listener config-ref="ESBListenerEndpoint" path="updateClaimsAssignedStore.json" doc:name="updateClaimAssignmentsStore"/>
+        <db:update config-ref="MySQL_Configuration" doc:name="updateClaimAssignmentsStore">
+            <db:parameterized-query><![CDATA[UPDATE protolytic_claims_assignment 
+SET adjuster_name = #[message.inboundProperties.'http.query.params'.adjuster_name], 
+date_from = NOW(), 
+date_to =  #[message.inboundProperties.'http.query.params'.date_to], 
+notes =  #[message.inboundProperties.'http.query.params'.notes]
+WHERE claim_number = #[message.inboundProperties.'http.query.params'.claim_number];]]></db:parameterized-query>
+        </db:update>
+        <set-payload value="0" doc:name="Set Payload"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="createClaimsAssignment" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="createClaimsAssignment.json" doc:name="create Claims Assignment"/>
+        <db:delete config-ref="MySQL_Configuration" doc:name="Remove old assignment">
+            <db:parameterized-query><![CDATA[DELETE FROM protolytic_claims_assignment WHERE adjuster_name = '' OR adjuster_name IS NULL OR claim_number = #[message.inboundProperties.'http.query.params'.claim_number];]]></db:parameterized-query>
+        </db:delete>
+        <db:delete config-ref="MySQL_Configuration" doc:name="Copy_of_Remove old assignment">
+            <db:parameterized-query><![CDATA[DELETE FROM protolytic_claims_assignment WHERE adjuster_name = '' OR adjuster_name IS NULL OR claim_number = #[message.inboundProperties.'http.query.params'.claim_number];]]></db:parameterized-query>
+        </db:delete>
+        <db:delete config-ref="MySQL_Configuration" doc:name="Copy_of_Remove old assignment">
+            <db:parameterized-query><![CDATA[DELETE FROM protolytic_claims_assignment WHERE adjuster_name = '' OR adjuster_name IS NULL OR claim_number = #[message.inboundProperties.'http.query.params'.claim_number];]]></db:parameterized-query>
+        </db:delete>
+        <db:insert config-ref="MySQL_Configuration" doc:name="insert claims assignment data">
+            <db:parameterized-query><![CDATA[INSERT INTO `protolytic_claims_assignment`
+(`claim_number`,
+`adjuster_name`,
+`date_from`,
+`date_to`,
+`notes`)
+VALUES
+(#[message.inboundProperties.'http.query.params'.claim_number],
+#[message.inboundProperties.'http.query.params'.adjuster_name],
+#[message.inboundProperties.'http.query.params'.from_date],
+#[message.inboundProperties.'http.query.params'.date_to],
+#[message.inboundProperties.'http.query.params'.notes]);]]></db:parameterized-query>
+        </db:insert>
+        <json:object-to-json-transformer doc:name="Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="updateClaimsAssignment" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="updateClaimsAssignment.json" doc:name="update Claims Assignment"/>
+        <db:insert config-ref="MySQL_Configuration" doc:name="update claims assignment data">
+            <db:parameterized-query><![CDATA[INSERT INTO `protolytic_claims_assignment`
+(`claim_number`,
+`adjuster_name`,
+`date_from`,
+`date_to`,
+`notes`)
+VALUES
+(#[message.inboundProperties.'http.query.params'.claim_number],
+(#[message.inboundProperties.'http.query.params'.adjuster_name],
+NOW(),
+#[message.inboundProperties.'http.query.params'.date_to],
+#[message.inboundProperties.'http.query.params'.notes]);]]></db:parameterized-query>
+        </db:insert>
+        <json:object-to-json-transformer doc:name="Copy_of_Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="createReferralOverride" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="createReferralOverride.json" doc:name="create Referral Override"/>
+        <db:insert config-ref="MySQL_Configuration" doc:name="insert data">
+            <db:parameterized-query><![CDATA[INSERT INTO `protolytic_referral_overrides`
+(`claim_number`,
+`referral_number`,
+`adjuster_name`,
+`date`)
+VALUES
+(#[message.inboundProperties.'http.query.params'.claim_number],
+#[message.inboundProperties.'http.query.params'.referral_number],
+#[message.inboundProperties.'http.query.params'.adjuster_name],
+NOW())]]></db:parameterized-query>
+        </db:insert>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readNumberOverrides" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readNumberOverrides.json" doc:name="readNumberOverrides"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Overrides Data">
+            <db:parameterized-query><![CDATA[SELECT (SELECT count(referral_number) from protolytic_referral_overrides ro 
+WHERE ro.date >= DATE(DATE_SUB(NOW(),INTERVAL 7 DAY)) ) week1,
+(SELECT count(referral_number) from protolytic_referral_overrides ro 
+WHERE ro.date >= DATE(DATE_SUB(NOW(),INTERVAL 14 DAY)) AND ro.date < DATE(DATE_SUB(NOW(),INTERVAL 7 DAY))) week2,
+(SELECT count(referral_number) from protolytic_referral_overrides ro 
+WHERE ro.date >= DATE(DATE_SUB(NOW(),INTERVAL 21 DAY)) AND ro.date < DATE(DATE_SUB(NOW(),INTERVAL 14 DAY))) week3,
+(SELECT count(referral_number) from protolytic_referral_overrides ro 
+WHERE ro.date >= DATE(DATE_SUB(NOW(),INTERVAL 28 DAY)) AND ro.date < DATE(DATE_SUB(NOW(),INTERVAL 21 DAY))) week4,
+'Total' as time;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readNumberClaimsActionable" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readNumberClaims.json" doc:name="readNumberClaims "/>
+        <db:select config-ref="MySQL_Configuration" doc:name="read Claims Data">
+            <db:parameterized-query><![CDATA[SELECT (SELECT count(claim_number) from row_item ri
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 7 DAY)) ) week1,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 14 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 7 DAY))) week2,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 21 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 14 DAY))) week3,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 28 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 21 DAY))) week4,
+'Total' as time,
+(SELECT count(claim_number) from row_item ri
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 7 DAY)) AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week1_2,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 14 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 7 DAY))AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week2_2,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 21 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 14 DAY))AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week3_2,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 28 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 21 DAY))AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week4_2,
+'Action Required' as time_2,
+(SELECT count(claim_number) from row_item ri
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 7 DAY)) AND (CONCAT('R00', ri.id) IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week1_3,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 14 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 7 DAY))AND (CONCAT('R00', ri.id) IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week2_3,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 21 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 14 DAY))AND (CONCAT('R00', ri.id) IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week3_3,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 28 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 21 DAY))AND (CONCAT('R00', ri.id) IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))  week4_3,
+'No Action Required' as time_3;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Obj to JSON"/>
+    </flow>
+    <flow name="readOpenClaims.json" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readOpenClaims.json" doc:name="readOpenClaims.json"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Copy_of_read Claims Data">
+            <db:parameterized-query><![CDATA[SELECT (SELECT count(claim_number) from row_item ri
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 3 DAY)) AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))   days13,
+(SELECT count(claim_number) from row_item ri 
+WHERE created >= DATE(DATE_SUB(NOW(),INTERVAL 5 DAY)) AND created < DATE(DATE_SUB(NOW(),INTERVAL 3 DAY))AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))   days45,
+(SELECT count(claim_number) from row_item ri 
+WHERE created < DATE(DATE_SUB(NOW(),INTERVAL 5 DAY))AND (CONCAT('R00', ri.id) NOT IN (SELECT rh.referral_number FROM protolytic_referral_history rh)))   days6,
+'Total' as time;]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Obj to JSON"/>
+    </flow>
+    <flow name="createClaimReferralCanonical" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="createClaimReferralCanonical.json" doc:name="HTTP"/>
+        <set-variable variableName="payorId" value="#[message.inboundProperties.'http.query.params'.payorId]" doc:name="payorId"/>
+        <set-variable variableName="payorName" value="#[message.inboundProperties.'http.query.params'.payorName]" doc:name="payorName"/>
+        <set-variable variableName="loadId" value="#[message.inboundProperties.'http.query.params'.loadId]" doc:name="loadId"/>
+        <set-variable variableName="claimNumber" value="#[message.inboundProperties.'http.query.params'.claimNumber]" doc:name="claimNumber"/>
+        <set-variable variableName="dateOfInjury" value="#[message.inboundProperties.'http.query.params'.dateOfInjury]" doc:name="dateOfInjury"/>
+        <set-variable variableName="icd1Code" value="#[message.inboundProperties.'http.query.params'.icd1Code]" doc:name="icd1Code"/>
+        <set-variable variableName="icd2Code" value="#[message.inboundProperties.'http.query.params'.icd2Code]" doc:name="icd2Code"/>
+        <set-variable variableName="icd3Code" value="#[message.inboundProperties.'http.query.params'.icd3Code]" doc:name="icd3Code"/>
+        <set-variable variableName="icd4Code" value="#[message.inboundProperties.'http.query.params'.icd4Code]" doc:name="icd4Code"/>
+        <set-variable variableName="icd5Code" value="#[message.inboundProperties.'http.query.params'.icd5Code]" doc:name="icd5Code"/>
+        <set-variable variableName="icd6Code" value="#[message.inboundProperties.'http.query.params'.icd6Code]" doc:name="icd6Code"/>
+        <set-variable variableName="icd7Code" value="#[message.inboundProperties.'http.query.params'.icd7Code]" doc:name="icd7Code"/>
+        <set-variable variableName="icd8Code" value="#[message.inboundProperties.'http.query.params'.icd8Code]" doc:name="icd8Code"/>
+        <set-variable variableName="icd9Code" value="#[message.inboundProperties.'http.query.params'.icd9Code]" doc:name="icd9Code"/>
+        <set-variable variableName="icd10Code" value="#[message.inboundProperties.'http.query.params'.icd10Code]" doc:name="icd10Code"/>
+        <set-variable variableName="icd11Code" value="#[message.inboundProperties.'http.query.params'.icd11Code]" doc:name="icd11Code"/>
+        <set-variable variableName="icd12Code" value="#[message.inboundProperties.'http.query.params'.icd12Code]" doc:name="icd12Code"/>
+        <set-variable variableName="icd13Code" value="#[message.inboundProperties.'http.query.params'.icd13Code]" doc:name="icd13Code"/>
+        <set-variable variableName="icd14Code" value="#[message.inboundProperties.'http.query.params'.icd14Code]" doc:name="icd14Code"/>
+        <set-variable variableName="icd15Code" value="#[message.inboundProperties.'http.query.params'.icd15Code]" doc:name="icd15Code"/>
+        <set-variable variableName="icd16Code" value="#[message.inboundProperties.'http.query.params'.icd16Code]" doc:name="icd16Code"/>
+        <set-variable variableName="icd17Code" value="#[message.inboundProperties.'http.query.params'.icd17Code]" doc:name="icd17Code"/>
+        <set-variable variableName="icd18Code" value="#[message.inboundProperties.'http.query.params'.icd18Code]" doc:name="icd18Code"/>
+        <set-variable variableName="icd19Code" value="#[message.inboundProperties.'http.query.params'.icd19Code]" doc:name="icd19Code"/>
+        <set-variable variableName="icd20Code" value="#[message.inboundProperties.'http.query.params'.icd20Code]" doc:name="icd20Code"/>
+        <set-variable variableName="claimantFirstName" value="#[message.inboundProperties.'http.query.params'.claimantFirstName]" doc:name="claimantFirstName"/>
+        <set-variable variableName="claimantLastName" value="#[message.inboundProperties.'http.query.params'.claimantLastName]" doc:name="claimantLastName"/>        
+        <set-variable variableName="claimantSsn" value="#[message.inboundProperties.'http.query.params'.claimantSsn]" doc:name="claimantSsn"/>
+        <set-variable variableName="procedureCodeServiceType" value="#[message.inboundProperties.'http.query.params'.procedureCodeServiceType]" doc:name="procedureCodeServiceType"/>
+        <set-variable variableName="procedureCode" value="#[message.inboundProperties.'http.query.params'.procedureCode]" doc:name="procedureCode"/>
+        <set-variable variableName="procedureCodeModifier" value="#[message.inboundProperties.'http.query.params'.procedureCodeModifier]" doc:name="procedureCodeModifier"/>
+        <set-variable variableName="dateOfServiceFrom" value="#[message.inboundProperties.'http.query.params'.dateOfServiceFrom]" doc:name="dateOfServiceFrom"/>
+        <set-variable variableName="dateOfServiceTo" value="#[message.inboundProperties.'http.query.params'.dateOfServiceTo]" doc:name="dateOfServiceTo"/>
+        <set-variable variableName="employer" value="#[message.inboundProperties.'http.query.params'.employer]" doc:name="employer"/>
+        <set-variable variableName="adjusterPhone" value="#[message.inboundProperties.'http.query.params'.adjusterPhone]" doc:name="adjusterPhone"/>
+        <set-variable variableName="physicianName" value="#[message.inboundProperties.'http.query.params'.physicianName]" doc:name="physicianName"/>
+        <set-variable variableName="physicianPhone" value="#[message.inboundProperties.'http.query.params'.physicianPhone]" doc:name="physicianPhone"/>
+        <set-variable variableName="physicianFax" value="#[message.inboundProperties.'http.query.params'.physicianFax]" doc:name="physicianFax"/>
+        <set-variable variableName="dateOfBirth" value="#[message.inboundProperties.'http.query.params'.dateOfBirth]" doc:name="dateOfBirth"/>
+        <set-variable variableName="sex" value="#[message.inboundProperties.'http.query.params'.sex]" doc:name="sex"/>
+        <set-variable variableName="claimantPhoneNumber" value="#[message.inboundProperties.'http.query.params'.claimantPhoneNumber]" doc:name="claimantPhoneNumber"/>
+        <set-variable variableName="claimantEmail" value="#[message.inboundProperties.'http.query.params'.claimantEmail]" doc:name="claimantEmail"/>
+        <set-variable variableName="claimantAddressStreet" value="#[message.inboundProperties.'http.query.params'.claimantAddressStreet]" doc:name="claimantAddressStreet"/>
+        <set-variable variableName="claimantAddressCity" value="#[message.inboundProperties.'http.query.params'.claimantAddressCity]" doc:name="claimantAddressCity"/>
+        <set-variable variableName="claimantAddressState" value="#[message.inboundProperties.'http.query.params'.claimantAddressState]" doc:name="claimantAddressState"/>
+        <set-variable variableName="claimantAddressZip" value="#[message.inboundProperties.'http.query.params'.claimantAddressZip]" doc:name="claimantAddressZip"/>
+        <set-variable variableName="claimantHeight" value="#[message.inboundProperties.'http.query.params'.claimantHeight]" doc:name="claimantHeight"/>
+        <set-variable variableName="claimantWeight" value="#[message.inboundProperties.'http.query.params'.claimantWeight]" doc:name="claimantWeight"/>
+        <set-variable variableName="claimantReferral" value="#[message.inboundProperties.'http.query.params'.claimantReferral]" doc:name="claimantReferral"/>
+        <set-variable variableName="claimantCptRequested" value="#[message.inboundProperties.'http.query.params'.claimantCptRequested]" doc:name="claimantCptRequested"/>
+        <set-variable variableName="claimantCatastrophic" value="#[message.inboundProperties.'http.query.params'.claimantCatastrophic]" doc:name="claimantCatastrophic"/>
+        <set-variable variableName="claimantSmoker" value="#[message.inboundProperties.'http.query.params'.claimantSmoker]" doc:name="claimantSmoker"/>
+        <logger message="****** 111 logger GREG vars:  #[flowVars]" level="INFO" doc:name="Logger"/>
+        <response>
+            <json:object-to-json-transformer doc:name="Object to JSON"/>
+        </response>
+        <set-payload value="#[flowVars.?payorId or &quot; &quot;]|#[flowVars.?payorName or &quot; &quot;]|#[flowVars.?loadId or &quot; &quot;]|#[flowVars.?claimNumber or &quot; &quot;]|#[flowVars.?dateOfInjury or &quot; &quot;]|#[flowVars.?icd1Code or &quot; &quot;]|#[flowVars.?icd2Code or &quot; &quot;]|#[flowVars.?icd3Code or &quot; &quot;]|#[flowVars.?icd4Code or &quot; &quot;]|#[flowVars.?icd5Code or &quot; &quot;]|#[flowVars.?icd6Code or &quot; &quot;]|#[flowVars.?icd7Code or &quot; &quot;]|#[flowVars.?icd8Code or &quot; &quot;]|#[flowVars.?icd9Code or &quot; &quot;]|#[flowVars.?icd10Code or &quot; &quot;]|#[flowVars.?icd11Code or &quot; &quot;]|#[flowVars.?icd12Code or &quot; &quot;]|#[flowVars.?icd13Code or &quot; &quot;]|#[flowVars.?icd14Code or &quot; &quot;]|#[flowVars.?icd15Code or &quot; &quot;]|#[flowVars.?icd16Code or &quot; &quot;]|#[flowVars.?icd17Code or &quot; &quot;]|#[flowVars.?icd18Code or &quot; &quot;]|#[flowVars.?icd19Code or &quot; &quot;]|#[flowVars.?icd20Code or &quot; &quot;]|#[flowVars.?claimantFirstName or &quot; &quot;]|#[flowVars.?claimantLastName or &quot; &quot;]|#[flowVars.?claimantSsn or &quot; &quot;]|#[flowVars.?procedureCodeServiceType or &quot; &quot;]|#[flowVars.?procedureCode or &quot; &quot;]|#[flowVars.?procedureCodeModifier or &quot; &quot;]|#[flowVars.?dateOfServiceFrom or &quot; &quot;]|#[flowVars.?dateOfServiceTo or &quot; &quot;]|#[flowVars.?employer  or &quot; &quot;]|#[flowVars.?adjusterPhone or &quot; &quot;]|#[flowVars.?physicianName or &quot; &quot;]|#[flowVars.?physicianPhone or &quot; &quot;]|#[flowVars.?physicianFax or &quot; &quot;]|#[flowVars.?dateOfBirth or &quot; &quot;]|#[flowVars.?sex or &quot; &quot;]|#[flowVars.?claimantPhoneNumber or &quot; &quot;]|#[flowVars.?claimantEmail or &quot; &quot;]|#[flowVars.?claimantAddressStreet or &quot; &quot;]|#[flowVars.?claimantAddressCity or &quot; &quot;]|#[flowVars.?claimantAddressState or &quot; &quot;]|#[flowVars.?claimantAddressZip or &quot; &quot;]|#[flowVars.?claimantHeight or &quot; &quot;]|#[flowVars.?claimantWeight or &quot; &quot;]|#[flowVars.?claimantReferral or &quot; &quot;]|#[flowVars.?claimantCptRequested or &quot; &quot;]|#[flowVars.?claimantCatastrophic or &quot; &quot;]|#[flowVars.?claimantSmoker or &quot; &quot;]" doc:name="Set Payload"/>
+        <logger message="&quot; ****** 222 logger GREG vars:  &quot;,  #[payload]" level="WARN" doc:name="Copy_of_Logger"/>
+        <file:outbound-endpoint responseTimeout="10000" doc:name="File" path="/tmp/protolytic-files" outputPattern="referralCanon.csv" connector-ref="File1"/>
+        <logger message="&quot; ****** 333 logger GREG vars:  &quot;,  #[payload]" level="WARN" doc:name="Copy_of_Logger"/>
+        <set-payload value="success" doc:name="Set Payload"/>
+        <logger message="&quot; ****** 444 logger GREG vars:  &quot;,  #[payload]" level="INFO" doc:name="Copy_of_Copy_of_Logger"/>
+    </flow>
+    <flow name="letter_attachment" initialState="started">
+        <file:inbound-endpoint path="/private/tmp/file_drop" moveToDirectory="/private/tmp/file_drop/file_drop_br_pickup" connector-ref="File" responseTimeout="10000" doc:name="File" mimeType="application/pdf"/>
+        <logger message="&quot;MPR engine - v40 greg&quot;, #[payload.fileSize], #[payload], #[flowVars.originalFilename], &quot;******************&quot; , #[message], #[message.inboundAttachments]" level="INFO" doc:name="Logger"/>
+        <file:file-to-byte-array-transformer mimeType="application/pdf" doc:name="File to Byte Array"/>
+        <set-variable variableName="fileName" value="#[message.inboundProperties['originalFilename']]" doc:name="Variable"/>
+        <set-attachment attachmentName="#[message.inboundProperties['originalFilename']]" value="#[payload]" contentType="application/pdf" doc:name="Attachment"/>
+        <logger message="&quot;MPR engine - v40 greg&quot;, #[payload.fileSize], #[payload], #[flowVars.originalFilename], &quot;******************&quot; , #[message], #[message.inboundAttachments]" level="INFO" doc:name="Copy_of_Logger"/>
+        <scripting:transformer doc:name="Groovy">
+            <scripting:script engine="Groovy">
+            	<![CDATA[sleep(20000);
+return message.payload;
+	    				
+]]>
+        	</scripting:script>
+        </scripting:transformer>
+        <db:update config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[UPDATE `attachment`
+SET `mime` = "application/pdf", `data` = #[payload]
+WHERE name = #[flowVars.originalFilename];]]></db:parameterized-query>
+        </db:update>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[SELECT id FROM attachment WHERE name = #[flowVars.fileName];]]></db:parameterized-query>
+        </db:select>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[SELECT `from`, `to`, `subject`, `body`, `to_name`
+FROM `email`
+WHERE `attachment_ID` = #[message.payload.get(0).id]]]></db:parameterized-query>
+        </db:select>
+        <set-variable variableName="to" value="#[message.payload[0].to]" doc:name="to"/>
+        <set-variable variableName="from" value="#[message.payload[0].from]" doc:name="from"/>
+        <set-variable variableName="subject" value="#[message.payload[0].subject]" doc:name="subject"/>
+        <set-session-variable variableName="subj" value="#[message.payload[0].subject]" doc:name="Session Variable"/>
+        <set-payload value="#[message.payload[0].to_name],#[System.getProperty('line.separator')] #[message.payload[0].body] #[System.getProperty('line.separator')] #[System.getProperty('line.separator')] #[System.getProperty('line.separator')]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                " mimeType="text/html" doc:name="Set Payload"/>
+        <logger message=" &quot; flowVars.subject&quot; ,#[flowVars.subject], #[sessionVars.subj], #[flowVars.subject]" level="INFO" doc:name="Logger"/>
+        <smtps:outbound-endpoint host="smtp.gmail.com" port="465" user="mpr.greg.omarah" password="3xy77NMBc6Hb" to="#[flowVars.to]" from="#[flowVars.from]" subject="#[sessionVars.subj]" replyTo="#[flowVars.from]" responseTimeout="10000" doc:name="Send an email"/>
+    </flow>
+ <flow name="Copy_of_file_to_que" processingStrategy="asynchronous">
+       <file:inbound-endpoint path="/tmp/protolytic-files" moveToDirectory="/tmp/protolytic-files/pickup" connector-ref="File1" responseTimeout="10000" doc:name="Copy_of_File"/>
+        <set-property propertyName="payload" value="#[flowVars.moveToDirectory]/#[message.inboundProperties['originalFilename']]" doc:name="Copy_of_Property"/>
+        <message-properties-transformer doc:name="Copy_of_muleProperties">
+            <delete-message-property key="MULE_ENDPOINT"/>
+            <delete-message-property key="MULE_SESSION"/>
+            <delete-message-property key="MULE_ENCODING"/>
+            <delete-message-property key="MULE_ROOT_MESSAGE_ID"/>
+            <delete-message-property key="filename"/>
+        </message-properties-transformer>
+        <jms:outbound-endpoint queue="protolytic-files-to-process" connector-ref="Active_MQ" mimeType="text/plain" disableTemporaryReplyToDestinations="true" doc:name="Copy_of_JMS">
+            <jms:transaction action="NONE"/>
+        </jms:outbound-endpoint>
+    </flow>
+    <flow name="readReferralServiceGroup" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readReferralServiceGroup.json" doc:name="HTTP"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Database">
+            <db:parameterized-query><![CDATA[select * from protolytic_service_group]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+    </flow>
+    <flow name="readServiceGroupCPT" initialState="started">
+        <http:listener config-ref="ESBListenerEndpoint" path="readServiceGroupCPTStore.json" doc:name="Copy_of_HTTP"/>
+        <db:select config-ref="MySQL_Configuration" doc:name="Copy_of_Database">
+            <db:parameterized-query><![CDATA[select * from protolytic_service_group 
+where CategoryProtolytic = #[message.inboundProperties.'http.query.params'.group];]]></db:parameterized-query>
+        </db:select>
+        <json:object-to-json-transformer doc:name="Copy_of_Object to JSON"/>
+    </flow>    <!--comment-->
+</mule>
